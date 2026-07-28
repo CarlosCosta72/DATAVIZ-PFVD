@@ -12,7 +12,7 @@ Uso:
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State, dash_table
 
 # ============================================================
 # DADOS
@@ -54,6 +54,12 @@ CRITERIOS = {
 }
 
 POP_MINIMA = 20_000  # elegibilidade do ranking (ver justificativa no rodapé)
+
+# ---- Marco Legal do Saneamento (Lei 14.026/2020) ----
+ANO_META_LEGAL = 2033        # prazo oficial da lei
+ANO_HORIZONTE_PROJ = 2030    # até onde projetamos
+JANELA_PROJ = 5              # regressão sobre os últimos N anos (tendência atual)
+METAS_MARCO_LEGAL = {"Água": 99.0, "Ciclo completo": 90.0}
 
 # ---- Paleta (mesma justificativa do notebook do PFVD) ----
 # Sequencial de azuis: as 3 etapas da cascata são ORDINAIS.
@@ -97,6 +103,56 @@ def cascata_municipio(row: pd.Series) -> dict:
     return {"Água": row.IN023_AE, "Coleta": row.IN047_AE,
             "Ciclo completo": ciclo}
 
+def projetar_serie(anos: list, valores: list, anos_futuros: list,
+                    janela: int = JANELA_PROJ) -> tuple:
+    """
+    Regressão linear (mínimos quadrados) sobre os últimos `janela` anos com
+    dado válido. Janela curta = sensível à tendência recente, não à média
+    histórica inteira (o ritmo de investimento de 2010 não representa o atual).
+    Retorna (valores_projetados, taxa_anual_em_p.p.).
+    """
+    pares = [(a, v) for a, v in zip(anos, valores) if pd.notna(v)]
+    if len(pares) < 2:
+        return [np.nan] * len(anos_futuros), np.nan
+    pares = pares[-janela:]
+    xs = np.array([p[0] for p in pares])
+    ys = np.array([p[1] for p in pares])
+    taxa, intercepto = np.polyfit(xs, ys, 1)
+    proj = np.clip(np.polyval([taxa, intercepto], anos_futuros), 0, 100)
+    return proj.tolist(), float(taxa)
+
+
+def avaliar_marco_legal(uf: str) -> dict:
+    """
+    Projeta Água e Ciclo completo até ANO_HORIZONTE_PROJ e estima em que ano
+    (se algum) a meta do Marco Legal seria atingida no ritmo atual.
+    """
+    anos = sorted(DADOS.ano_referencia.unique())
+    serie = {"Água": [], "Ciclo completo": []}
+    for a in anos:
+        g = DADOS[(DADOS.ano_referencia == a) & (DADOS.sigla_uf == uf)]
+        c = cascata(g)
+        serie["Água"].append(c["Água"])
+        serie["Ciclo completo"].append(c["Ciclo completo"])
+
+    anos_proj = list(range(anos[-1], ANO_HORIZONTE_PROJ + 1))
+    resultado = {"anos_hist": anos, "anos_proj": anos_proj}
+    for ind, meta in METAS_MARCO_LEGAL.items():
+        proj, taxa = projetar_serie(anos, serie[ind], anos_proj)
+        ultimo_valor = next((v for v in reversed(serie[ind]) if pd.notna(v)), np.nan)
+        ano_meta = None
+        if pd.notna(taxa) and pd.notna(ultimo_valor):
+            if ultimo_valor >= meta:
+                ano_meta = anos[-1]
+            elif taxa > 0:
+                ano_meta = int(round(anos[-1] + (meta - ultimo_valor) / taxa))
+        resultado[ind] = {
+            "serie": serie[ind], "proj": proj, "taxa_anual": taxa,
+            "valor_2030": proj[-1] if proj else np.nan, "meta": meta,
+            "ano_estimado_meta": ano_meta,
+            "atinge_2033": ano_meta is not None and ano_meta <= ANO_META_LEGAL,
+        }
+    return resultado
 
 def elegiveis(uf: str, ano: int) -> pd.DataFrame:
     """Municípios elegíveis ao ranking: pop. mínima + 3 indicadores presentes."""
@@ -257,6 +313,94 @@ def fig_evolucao(uf: str, ano_sel: int) -> go.Figure:
                      zeroline=False)
     return _layout_base(fig, 320)
 
+def fig_comparacao_uf(casc_a: dict, uf_a: str, casc_b: dict, uf_b: str) -> go.Figure:
+    """
+    Compara a Escada de dois estados lado a lado, mesma escala 0-100.
+    Reaproveita a marca (barra) da fig_escada — leitura já é familiar,
+    só adiciona uma segunda série por cor (evita reinventar o padrão visual).
+    """
+    etapas = ["Água", "Coleta", "Ciclo completo"]
+    v_a = [casc_a[e] for e in etapas]
+    v_b = [casc_b[e] for e in etapas]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=etapas, x=v_a, orientation="h", name=uf_a, marker_color=DESTAQUE,
+        text=[f"{x:.1f}%" if pd.notna(x) else "s/ dado" for x in v_a],
+        textposition="outside", cliponaxis=False,
+        hovertemplate=f"{uf_a} — %{{y}}: %{{x:.1f}}%<extra></extra>"))
+    fig.add_trace(go.Bar(
+        y=etapas, x=v_b, orientation="h", name=uf_b, marker_color=AZ[2],
+        text=[f"{x:.1f}%" if pd.notna(x) else "s/ dado" for x in v_b],
+        textposition="outside", cliponaxis=False,
+        hovertemplate=f"{uf_b} — %{{y}}: %{{x:.1f}}%<extra></extra>"))
+
+    fig.update_yaxes(autorange="reversed", ticksuffix="  ")
+    fig.update_xaxes(range=[0, 112], ticksuffix="%", gridcolor="#EDEFF2", zeroline=False)
+    fig.update_layout(title=dict(text=f"{uf_a} vs. {uf_b}", x=0, font=dict(size=15)),
+                      barmode="group")
+    fig = _layout_base(fig, 280)
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.15, x=0))
+    return fig
+
+def fig_marco_legal(marco: dict, uf: str) -> go.Figure:
+    """
+    Histórico (linha cheia) + projeção até 2030 (pontilhada = incerteza
+    explícita) vs. metas do Marco Legal (prazo 2033).
+    """
+    fig = go.Figure()
+    cores = {"Água": AZ[1], "Ciclo completo": DESTAQUE}
+    anos_h, anos_p = marco["anos_hist"], marco["anos_proj"]
+
+    for ind, cor in cores.items():
+        d = marco[ind]
+        fig.add_trace(go.Scatter(
+            x=anos_h, y=d["serie"], mode="lines+markers", name=ind,
+            line=dict(color=cor, width=3), marker=dict(size=5),
+            hovertemplate=f"{ind} %{{x}}: %{{y:.1f}}%<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=anos_p, y=d["proj"], mode="lines", showlegend=False,
+            line=dict(color=cor, width=2, dash="dot"),
+            hovertemplate=f"{ind} (projeção) %{{x}}: %{{y:.1f}}%<extra></extra>"))
+        fig.add_hline(y=d["meta"], line=dict(color=cor, width=1, dash="dash"),
+                      opacity=0.5, annotation_text=f"meta {ind.lower()}: {d['meta']:.0f}%",
+                      annotation_font=dict(size=10, color=cor))
+
+    fig.add_vline(x=ANO_META_LEGAL, line=dict(color=CINZA_TXT, width=1, dash="dot"),
+                 annotation_text=f"prazo legal {ANO_META_LEGAL}",
+                 annotation_font=dict(size=10, color=CINZA_TXT))
+    fig.update_layout(title=dict(
+        text=f"Marco Legal do Saneamento — projeção {uf} até {ANO_HORIZONTE_PROJ} "
+             f"(tendência dos últimos {JANELA_PROJ} anos)",
+        x=0, font=dict(size=15)),
+        legend=dict(orientation="h", y=1.15, x=0))
+    fig.update_xaxes(gridcolor="#EDEFF2", dtick=2,
+                     range=[anos_h[0] - 0.5, ANO_META_LEGAL + 0.5])
+    fig.update_yaxes(range=[0, 105], ticksuffix="%", gridcolor="#EDEFF2", zeroline=False)
+    return _layout_base(fig, 320)
+
+
+def fig_distribuicao(ele: pd.DataFrame, col: str, valor_uf: float,
+                     val_melhor: float, val_pior: float) -> go.Figure:
+    """
+    Boxplot dos elegíveis: responde 'o pior é um outlier isolado, ou metade
+    do estado está mal?' — pergunta que top/bottom 8 sozinho não responde.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=ele[col], boxpoints="all", jitter=0.4,
+                         marker=dict(color=CINZA, size=4, opacity=0.5),
+                         line=dict(color=CINZA_TXT), fillcolor="white",
+                         hovertemplate="%{x:.1f}%<extra></extra>", name=""))
+    for val, cor, rotulo in [(val_melhor, VERDE, "melhor"), (val_pior, VERMELHO, "pior"),
+                              (valor_uf, DESTAQUE, "média UF")]:
+        if pd.notna(val):
+            fig.add_vline(x=val, line=dict(color=cor, width=2, dash="dot"),
+                         annotation_text=rotulo, annotation_font=dict(size=10, color=cor))
+    fig.update_xaxes(range=[0, 105], ticksuffix="%", gridcolor="#EDEFF2", zeroline=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(title=dict(text="Distribuição dos municípios elegíveis",
+                                  x=0, font=dict(size=13)))
+    return _layout_base(fig, 160)
 
 # ============================================================
 # COMPONENTES DE LAYOUT
@@ -272,6 +416,24 @@ def kpi_card(titulo, valor, delta):
         html.Div(seta, className="kpi-delta", style={"color": cor}),
     ])
 
+def selo_marco_legal(marco: dict) -> html.Div:
+    itens = []
+    for ind in ("Água", "Ciclo completo"):
+        d = marco[ind]
+        ano_meta = d["ano_estimado_meta"]
+        if ano_meta is None:
+            texto, cor = "sem tendência suficiente para projetar", CINZA_TXT
+        elif d["atinge_2033"]:
+            texto, cor = f"no ritmo atual, atinge a meta em {ano_meta}", VERDE
+        else:
+            texto, cor = f"no ritmo atual, só atinge em {ano_meta} (após o prazo)", VERMELHO
+        v2030 = f"{d['valor_2030']:.1f}%" if pd.notna(d["valor_2030"]) else "s/ dado"
+        itens.append(html.Div(className="marco-item", children=[
+            html.Span(f"{ind}: ", style={"fontWeight": 700}),
+            html.Span(f"projeção {ANO_HORIZONTE_PROJ} = {v2030}"),
+            html.Span(f" · {texto}", style={"color": cor}),
+        ]))
+    return html.Div(className="marco-selos", children=itens)
 
 def justificativa(texto_md):
     """Painel recolhível com a fundamentação teórica do gráfico."""
@@ -320,7 +482,14 @@ JUST_EVOLUCAO = """
 | Eixo y desde 0 | Apesar de ser linha | O valor absoluto importa (% de população atendida), não só a tendência |
 | ⚠ Limitação declarada | Nota abaixo do gráfico | O nº de municípios que reportam ao SNIS varia por ano; oscilações bruscas são artefato de reporte |
 """
-
+JUST_MARCO_LEGAL = """
+| Decisão | Escolha | Fundamentação |
+|---|---|---|
+| Janela de regressão | Últimos 5 anos, não a série toda | O ritmo de investimento de 2010 não representa a tendência atual; janela longa suavizaria demais uma eventual aceleração/desaceleração recente |
+| Linha pontilhada na projeção | Estilo visual distinto do histórico | Projeção é incerteza explícita — o leitor não deve confundir com dado observado |
+| Meta em linha horizontal | Não em barra separada | Comparação direta trajetória × meta no mesmo plano cartesiano |
+| Prazo 2033 marcado, projeção até 2030 | Não estendemos a reta até 2033 | Regressão linear a 12 anos de distância tem erro grande demais para ser exibida como se fosse dado; o "ano estimado" é extrapolado à parte, só como texto |
+"""
 
 # ============================================================
 # APP
@@ -367,6 +536,15 @@ app.index_string = """
   .nota { font-size:12px; color:#5A6068; margin:0 4px 8px; }
   .aviso { background:#FFF7ED; border:1px solid #F5D6B0; color:#8A5A1E;
            border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:18px; }
+  .marco-selos { margin: 4px 0 10px; }
+  .marco-item { font-size:13px; margin-bottom:4px; }
+  .tabela-cab { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .tabela-titulo { font-size:13px; font-weight:700; color:#0B3C6B; }
+  .tabela-busca { width:100%; padding:6px 10px; margin-bottom:10px; border:1px solid #E4E7EB;
+                  border-radius:6px; font-size:13px; box-sizing:border-box; }
+  .btn-export { background:#0B3C6B; color:white; border:none; border-radius:6px;
+                padding:6px 14px; font-size:12px; cursor:pointer; }
+  .btn-export:hover { background:#134A82; }
 </style>
 </head>
 <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>
@@ -394,6 +572,15 @@ app.layout = html.Div(className="container", children=[
                 options=[{"label": v, "value": k} for k, v in CRITERIOS.items()],
                 value="ciclo", clearable=False),
         ]),
+        html.Div(className="controle", children=[
+            html.Label("Comparar com outro estado (opcional)"),
+            dcc.Dropdown(
+                id="uf-comparacao",
+                options=[{"label": "— Nenhuma —", "value": ""}] +
+                        [{"label": f"{UF_NOMES[u]} ({u})", "value": u}
+                         for u in sorted(UF_NOMES)],
+                value="", clearable=False),
+        ]),
         html.Div(className="controle", style={"flex": "2"}, children=[
             html.Label("Ano"),
             dcc.Slider(
@@ -412,7 +599,9 @@ app.layout = html.Div(className="container", children=[
         dcc.Graph(id="g-escada-uf", config={"displayModeBar": False}),
         justificativa(JUST_ESCADA),
     ]),
-
+    html.Div(id="painel-comparacao", className="painel", style={"display": "none"}, children=[
+        dcc.Graph(id="g-comparacao-uf", config={"displayModeBar": False}),
+    ]),
     # ---- Melhor x Pior ----
     html.Div(className="dupla", children=[
         html.Div(className="painel", children=[
@@ -435,6 +624,7 @@ app.layout = html.Div(className="container", children=[
     html.Div(className="dupla", children=[
         html.Div(className="painel", children=[
             dcc.Graph(id="g-ranking", config={"displayModeBar": False}),
+            dcc.Graph(id="g-distribuicao", config={"displayModeBar": False}),
             justificativa(JUST_RANKING),
         ]),
         html.Div(className="painel", children=[
@@ -445,7 +635,38 @@ app.layout = html.Div(className="container", children=[
             justificativa(JUST_EVOLUCAO),
         ]),
     ]),
-
+    html.Div(className="painel", children=[
+        html.Div(id="marco-legal-status"),
+        dcc.Graph(id="g-marco-legal", config={"displayModeBar": False}),
+        justificativa(JUST_MARCO_LEGAL),
+    ]),
+    html.Div(className="painel", children=[
+        html.Div(className="tabela-cab", children=[
+            html.Span(id="tabela-titulo", className="tabela-titulo"),
+            html.Button("⬇ Exportar CSV", id="btn-export-csv", n_clicks=0,
+                       className="btn-export"),
+        ]),
+        dcc.Input(id="tabela-busca", type="text", placeholder="Buscar município…",
+                 className="tabela-busca", debounce=True),
+        dash_table.DataTable(
+            id="tabela-dados",
+            columns=[
+                {"name": "Município", "id": "nome_municipio"},
+                {"name": "Água (%)", "id": "IN023_AE", "type": "numeric", "format": {"specifier": ".1f"}},
+                {"name": "Coleta (%)", "id": "IN047_AE", "type": "numeric", "format": {"specifier": ".1f"}},
+                {"name": "Tratamento (%)", "id": "IN016_AE", "type": "numeric", "format": {"specifier": ".1f"}},
+                {"name": "Ciclo (%)", "id": "ciclo", "type": "numeric", "format": {"specifier": ".1f"}},
+                {"name": "Pop. urbana", "id": "POP_URB", "type": "numeric", "format": {"specifier": ",.0f"}},
+            ],
+            sort_action="native", page_size=10,
+            style_table={"overflowX": "auto"},
+            style_cell={"fontFamily": "Segoe UI, Helvetica, Arial, sans-serif",
+                       "fontSize": "12px", "padding": "6px 10px"},
+            style_header={"fontWeight": "700", "backgroundColor": "#F4F6F8",
+                         "textTransform": "uppercase", "fontSize": "11px", "color": CINZA_TXT},
+        ),
+        dcc.Download(id="download-csv"),
+    ]),
     html.Div(className="nota", children=[
         "Fonte: SNIS — Série Histórica municipal, via dankkom/snis-rawdata. ",
         f"Elegibilidade do ranking: população urbana ≥ {POP_MINIMA:,} hab. "
@@ -494,11 +715,20 @@ def _cabecalho(row, tipo, criterio, pos, total):
     Output("g-evolucao", "figure"),
     Output("nota-elegiveis", "children"),
     Output("aviso-dados", "children"),
+    Output("marco-legal-status", "children"),
+    Output("g-marco-legal", "figure"),
+    Output("g-distribuicao", "figure"),
+    Output("painel-comparacao", "style"),
+    Output("g-comparacao-uf", "figure"),
+    Output("tabela-dados", "data"),
+    Output("tabela-titulo", "children"),
     Input("uf", "value"),
     Input("ano", "value"),
     Input("criterio", "value"),
+    Input("uf-comparacao", "value"),
+    Input("tabela-busca", "value")
 )
-def atualizar(uf, ano, criterio):
+def atualizar(uf, ano, criterio,uf_comp, busca):
     g_uf = DADOS[(DADOS.sigla_uf == uf) & (DADOS.ano_referencia == ano)]
     g_ant = DADOS[(DADOS.sigla_uf == uf) & (DADOS.ano_referencia == ano - 1)]
 
@@ -577,8 +807,57 @@ def atualizar(uf, ano, criterio):
         else _fig_vazia("Sem dados suficientes para o ranking")
     fig_evo = fig_evolucao(uf, ano)
 
+    #---Marco Legal---
+    marco = avaliar_marco_legal(uf)
+    fig_marco = fig_marco_legal(marco, uf)
+    status_marco = selo_marco_legal(marco)
+
+    # ---- Distribuição ----
+    if len(ele) >= 2:
+        val_uf = casc.get("Ciclo completo") if criterio == "ciclo" else media_ponderada(g_uf, criterio)
+        fig_dist = fig_distribuicao(ele, col, val_uf, ele_ord.iloc[0][col], ele_ord.iloc[-1][col])
+    else:
+        fig_dist = _fig_vazia("Elegíveis insuficientes para distribuição")
+
+    if uf_comp:
+        g_comp = DADOS[(DADOS.sigla_uf == uf_comp) & (DADOS.ano_referencia == ano)]
+        fig_comp = fig_comparacao_uf(casc, uf, cascata(g_comp), uf_comp)
+        style_comp = {"display": "block"}
+    else:
+        fig_comp = _fig_vazia("")
+        style_comp = {"display": "none"}
+
+    # ---- Tabela de dados brutos ----
+    tabela_df = ele.copy()
+    if busca:
+        tabela_df = tabela_df[tabela_df.nome_municipio.str.contains(busca, case=False, na=False)]
+    tabela_dados = tabela_df[["nome_municipio", "IN023_AE", "IN047_AE",
+                              "IN016_AE", "ciclo", "POP_URB"]].to_dict("records")
+    tabela_titulo = f"Dados brutos — {len(tabela_dados)} de {len(ele)} elegível(eis)"
+
     return (kpis, fig_uf, cab_m, fig_m, bul_m, cab_p, fig_p, bul_p,
-            fig_rank, fig_evo, nota, aviso)
+            fig_rank, fig_evo, nota, aviso,
+            status_marco, fig_marco, fig_dist,          
+            style_comp, fig_comp, tabela_dados, tabela_titulo)
+
+@app.callback(
+    Output("download-csv", "data"),
+    Input("btn-export-csv", "n_clicks"),
+    State("uf", "value"),
+    State("ano", "value"),
+    State("tabela-busca", "value"),
+    prevent_initial_call=True,
+)
+def exportar_csv(n_clicks, uf, ano, busca):
+    ele = elegiveis(uf, ano)
+    if busca:
+        ele = ele[ele.nome_municipio.str.contains(busca, case=False, na=False)]
+    cols = ["nome_municipio", "sigla_uf", "ano_referencia",
+            "IN023_AE", "IN047_AE", "IN016_AE", "ciclo", "POP_URB"]
+    nome_arquivo = f"saneamento_{uf}_{ano}.csv"
+    # sep=";" e decimal="," porque é o padrão que o Excel em pt-BR espera
+    return dcc.send_data_frame(ele[cols].to_csv, nome_arquivo, index=False,
+                               sep=";", decimal=",")
 
 
 if __name__ == "__main__":
